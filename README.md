@@ -3,7 +3,7 @@
 REST API for **Quizify**, my B.Tech final-year project at Government Engineering College, Bilaspur. It handles authentication, quiz management, AI question generation with Google Gemini, submissions, grading and anti-cheat records.
 
 - **Frontend repo:** https://github.com/Gaurav-Soni24/major-frontend
-- **Live demo (frontend):** https://major-frontend-seven.vercel.app
+- **Live demo (frontend):** https://major-frontend-sable.vercel.app
 
 ## Features
 

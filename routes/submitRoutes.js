@@ -1,25 +1,26 @@
 const express = require('express');
-const router = express.Router();
-const { protect } = require('../middlewares/authMiddleware');
-const {
-  verifyGoogleAttempt,
-  startAttempt,
-  flagActivity,
-  processSubmission,
-  getQuizSubmissions,
-  getSubmissionDetails,
-  getStudentSubmissions
-} = require('../controllers/submitController');
+const { protect, requireStudent, requireAttempt, requireAttemptOrOwnerStudent } = require('../middlewares/authMiddleware');
+const c = require('../controllers/submitController');
 
-// Public routes for students taking the quiz
-router.post('/verify-google', verifyGoogleAttempt);
-router.post('/start-attempt', startAttempt);
-router.post('/flag', flagActivity); // Asynchronous base64 image logging
-router.post('/', processSubmission); // Final submission calculation
-router.get('/student/:email', getStudentSubmissions);
+module.exports = (limiters) => {
+  const router = express.Router();
 
-// Protected routes for teachers viewing data
-router.get('/quiz/:quizId', protect, getQuizSubmissions);
-router.get('/details/:submissionId', protect, getSubmissionDetails); // Fetches flagged images
+  // Student flow (no account: Google identity -> student token -> attempt token)
+  router.post('/verify-google', limiters.google, c.verifyGoogleAttempt);
+  router.post('/start-attempt', limiters.startAttempt, requireStudent, c.startAttempt);
+  router.post('/flag', limiters.flag, requireAttempt, c.flagActivity);
+  router.post('/', requireAttempt, c.processSubmission);
+  router.get('/student/:email', requireStudent, c.getStudentSubmissions);
 
-module.exports = router;
+  // Teacher review (Bearer JWT, quiz owner)
+  router.get('/quiz/:quizId', protect, c.getQuizSubmissions);
+  router.get('/details/:submissionId', protect, c.getSubmissionDetails);
+  router.patch('/details/:submissionId/grade', protect, c.gradeSubmission);
+  router.delete('/details/:submissionId', protect, c.deleteSubmission);
+
+  // Per-attempt routes (declared last: `/:submissionId/...`)
+  router.put('/:submissionId/answers', limiters.answers, requireAttempt, c.saveAnswers);
+  router.get('/:submissionId/result', requireAttemptOrOwnerStudent, c.getResult);
+
+  return router;
+};

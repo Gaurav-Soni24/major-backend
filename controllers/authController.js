@@ -1,242 +1,153 @@
-const User = require('../models/User');
 const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
-const { OAuth2Client } = require('google-auth-library');
+const User = require('../models/User');
+const { AppError } = require('../utils/AppError');
+const { signTeacherToken } = require('../services/tokenService');
+const { verifyGoogleCredential } = require('../services/googleVerifier');
+const { validateRegister, validateLogin, validateProfileUpdate, validateCredential } = require('../validators/auth');
 
-const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
+// Hash compared when the account does not exist, so response time does not reveal which emails exist.
+const DUMMY_HASH = bcrypt.hashSync('not-a-real-password', 10);
 
-// Generate JWT Token
-const generateToken = (userId, role) => {
-  return jwt.sign({ userId, role }, process.env.JWT_SECRET, {
-    expiresIn: '8h',
-  });
-};
+const INVALID_LOGIN = () => new AppError(401, 'UNAUTHENTICATED', 'Invalid email or password');
 
-// @desc    Register a new teacher (Local)
-// @route   POST /api/auth/register
-// @access  Public
+// @route POST /api/auth/register  (public)
 const registerUser = async (req, res, next) => {
   try {
-    const { name, email, password, role } = req.body;
+    const { name, email, password } = validateRegister(req.body);
+    if (await User.exists({ email })) throw new AppError(409, 'CONFLICT', 'Email already in use');
 
-    if (!name || !email || !password) {
-      return res.status(400).json({ success: false, message: 'Please provide all required fields' });
+    const hashed = await bcrypt.hash(password, 10);
+    try {
+      // `role` from the body is ignored on purpose: everyone registers as a teacher.
+      await User.create({ name, email, password: hashed, authProvider: 'local', isPasswordSet: true, role: 'teacher' });
+    } catch (err) {
+      if (err && err.code === 11000) throw new AppError(409, 'CONFLICT', 'Email already in use');
+      throw err;
     }
-
-    // Check if user exists
-    const userExists = await User.findOne({ email });
-    if (userExists) {
-      return res.status(400).json({ success: false, message: 'Email already in use' });
-    }
-
-    // Hash password
-    const salt = await bcrypt.genSalt(10);
-    const hashedPassword = await bcrypt.hash(password, salt);
-
-    // Create user
-    const user = await User.create({
-      name,
-      email,
-      password: hashedPassword,
-      authProvider: 'local',
-      isPasswordSet: true,
-      role: role || 'teacher',
-    });
-
-    if (user) {
-      res.status(201).json({
-        success: true,
-        message: 'User registered successfully. Please login.',
-      });
-    } else {
-      res.status(400).json({ success: false, message: 'Invalid user data' });
-    }
+    res.status(201).json({ success: true, message: 'User registered successfully. Please login.' });
   } catch (error) {
     next(error);
   }
 };
 
-// @desc    Authenticate a user (Local)
-// @route   POST /api/auth/login
-// @access  Public
+// @route POST /api/auth/login  (public)
 const loginUser = async (req, res, next) => {
   try {
-    const { email, password } = req.body;
-
-    if (!email || !password) {
-      return res.status(400).json({ success: false, message: 'Please provide email and password' });
-    }
-
+    const { email, password } = validateLogin(req.body);
     const user = await User.findOne({ email }).select('+password');
-
-    if (!user) {
-      return res.status(401).json({ success: false, message: 'Invalid email or password' });
-    }
-
-    // If user registered via Google and hasn't set a password yet
-    if (!user.isPasswordSet) {
-      return res.status(401).json({ 
-        success: false, 
-        message: 'You signed up with Google. Please use Google Login or reset your password.' 
-      });
-    }
-
-    const isMatch = await bcrypt.compare(password, user.password);
-
-    if (!isMatch) {
-      return res.status(401).json({ success: false, message: 'Invalid email or password' });
-    }
-
-    const token = generateToken(user._id, user.role);
+    const hash = user && user.password ? user.password : DUMMY_HASH;
+    const match = await bcrypt.compare(password, hash);
+    if (!user || !user.password || !user.isPasswordSet || !match) throw INVALID_LOGIN();
 
     res.status(200).json({
       success: true,
       message: 'Login successful',
-      token,
+      token: signTeacherToken(user._id, user.role),
       userId: user._id,
-      isPasswordSet: user.isPasswordSet
+      isPasswordSet: user.isPasswordSet,
+      user: { name: user.name, email: user.email, role: user.role },
     });
   } catch (error) {
     next(error);
   }
 };
 
-// @desc    Google Login / Signup
-// @route   POST /api/auth/google
-// @access  Public
+// @route POST /api/auth/google  (public)
 const googleAuth = async (req, res, next) => {
   try {
-    const { credential } = req.body;
-
-    if (!credential) {
-      return res.status(400).json({ success: false, message: 'Google credential missing' });
+    const credential = validateCredential(req.body);
+    let payload;
+    try {
+      payload = await verifyGoogleCredential(credential);
+    } catch (err) {
+      console.warn('[auth] Google verification failed:', String(err && err.message).slice(0, 120));
+      throw new AppError(401, 'UNAUTHENTICATED', 'Google authentication failed');
     }
+    if (!payload || !payload.email || payload.email_verified !== true) {
+      throw new AppError(401, 'UNAUTHENTICATED', 'Google account email is not verified');
+    }
+    const email = String(payload.email).toLowerCase();
+    const googleId = payload.sub;
+    const name = (payload.name || email.split('@')[0]).slice(0, 80);
 
-    // Verify token with Google
-    const ticket = await googleClient.verifyIdToken({
-      idToken: credential,
-      audience: process.env.GOOGLE_CLIENT_ID,
-    });
-    
-    const payload = ticket.getPayload();
-    const { email, name, sub: googleId, picture } = payload;
-
-    // Check if user already exists
     let user = await User.findOne({ email });
-
     if (user) {
-      // If user exists but doesn't have a googleId (e.g., originally signed up locally)
       if (!user.googleId) {
         user.googleId = googleId;
-        if (!user.profile.avatarUrl) user.profile.avatarUrl = picture;
+        if (!user.profile.avatarUrl && payload.picture) user.profile.avatarUrl = payload.picture;
         await user.save();
       }
     } else {
-      // New user signup via Google
       user = await User.create({
         name,
         email,
         googleId,
         authProvider: 'google',
-        isPasswordSet: false, // They haven't created a local password yet
+        isPasswordSet: false,
         role: 'teacher',
-        profile: {
-          avatarUrl: picture
-        }
+        profile: { avatarUrl: payload.picture || '' },
       });
     }
-
-    const token = generateToken(user._id, user.role);
 
     res.status(200).json({
       success: true,
       message: 'Google authentication successful',
-      token,
+      token: signTeacherToken(user._id, user.role),
       userId: user._id,
-      isPasswordSet: user.isPasswordSet
-    });
-  } catch (error) {
-    console.error('Google Auth Error:', error);
-    res.status(401).json({ success: false, message: 'Google authentication failed' });
-  }
-};
-
-// @desc    Update Teacher Profile & Set Password
-// @route   PUT /api/auth/profile
-// @access  Private (Teacher)
-const updateProfile = async (req, res, next) => {
-  try {
-    const { name, bio, department, institution, newPassword } = req.body;
-    
-    // Find user by ID attached from authMiddleware
-    const user = await User.findById(req.user.userId);
-    
-    if (!user) {
-      return res.status(404).json({ success: false, message: 'User not found' });
-    }
-
-    // Update basic info
-    if (name) user.name = name;
-    if (bio !== undefined) user.profile.bio = bio;
-    if (department !== undefined) user.profile.department = department;
-    if (institution !== undefined) user.profile.institution = institution;
-
-    // Handle password creation / update
-    if (newPassword) {
-      if (newPassword.length < 8) {
-        return res.status(400).json({ success: false, message: 'Password must be at least 8 characters' });
-      }
-      const salt = await bcrypt.genSalt(10);
-      user.password = await bcrypt.hash(newPassword, salt);
-      user.isPasswordSet = true;
-    }
-
-    await user.save();
-
-    res.status(200).json({
-      success: true,
-      message: 'Profile updated successfully',
-      data: {
-        name: user.name,
-        email: user.email,
-        profile: user.profile,
-        isPasswordSet: user.isPasswordSet
-      }
+      isPasswordSet: user.isPasswordSet,
+      user: { name: user.name, email: user.email, role: user.role },
     });
   } catch (error) {
     next(error);
   }
 };
 
-// @desc    Get Current User Profile
-// @route   GET /api/auth/profile
-// @access  Private (Teacher)
+const profileData = (user) => ({
+  name: user.name,
+  email: user.email,
+  role: user.role,
+  profile: user.profile,
+  isPasswordSet: user.isPasswordSet,
+  authProvider: user.authProvider,
+});
+
+// @route PUT /api/auth/profile  (teacher)
+const updateProfile = async (req, res, next) => {
+  try {
+    const input = validateProfileUpdate(req.body);
+    const user = await User.findById(req.user.userId).select('+password');
+    if (!user) throw new AppError(404, 'NOT_FOUND', 'User not found');
+
+    if (input.newPassword) {
+      // Changing an existing password requires proving the current one.
+      if (user.password) {
+        const ok = input.currentPassword ? await bcrypt.compare(input.currentPassword, user.password) : false;
+        if (!ok) throw new AppError(403, 'FORBIDDEN', 'Current password is incorrect');
+      }
+      user.password = await bcrypt.hash(input.newPassword, 10);
+      user.isPasswordSet = true;
+    }
+    if (input.name) user.name = input.name;
+    if (input.bio !== undefined) user.profile.bio = input.bio;
+    if (input.department !== undefined) user.profile.department = input.department;
+    if (input.institution !== undefined) user.profile.institution = input.institution;
+    await user.save();
+
+    res.status(200).json({ success: true, message: 'Profile updated successfully', data: profileData(user) });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @route GET /api/auth/profile  (teacher)
 const getProfile = async (req, res, next) => {
   try {
     const user = await User.findById(req.user.userId);
-    if (!user) {
-      return res.status(404).json({ success: false, message: 'User not found' });
-    }
-    
-    res.status(200).json({
-      success: true,
-      data: {
-        name: user.name,
-        email: user.email,
-        profile: user.profile,
-        isPasswordSet: user.isPasswordSet,
-        authProvider: user.authProvider
-      }
-    });
+    if (!user) throw new AppError(404, 'NOT_FOUND', 'User not found');
+    res.status(200).json({ success: true, data: profileData(user) });
   } catch (error) {
     next(error);
   }
 };
 
-module.exports = {
-  registerUser,
-  loginUser,
-  googleAuth,
-  updateProfile,
-  getProfile
-};
+module.exports = { registerUser, loginUser, googleAuth, updateProfile, getProfile };

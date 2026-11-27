@@ -1,21 +1,32 @@
 const express = require('express');
-const router = express.Router();
 const { protect } = require('../middlewares/authMiddleware');
 const {
   createQuiz,
   getTeacherQuizzes,
+  getQuiz,
+  updateQuiz,
+  duplicateQuiz,
   toggleQuizPublic,
   deleteQuiz,
-  getPublicQuiz
+  getPublicQuiz,
+  getQuizAnalytics,
 } = require('../controllers/quizController');
 
-// Public routes
-router.get('/public/:quizId', getPublicQuiz);
+module.exports = () => {
+  const router = express.Router();
 
-// Protected routes (Require Teacher JWT)
-router.post('/create', protect, createQuiz);
-router.get('/my-quizzes', protect, getTeacherQuizzes);
-router.post('/toggle-public', protect, toggleQuizPublic);
-router.delete('/:quizId', protect, deleteQuiz);
+  // Public
+  router.get('/public/:quizId', getPublicQuiz);
 
-module.exports = router;
+  // Teacher (Bearer JWT). Fixed paths are declared before `/:quizId`.
+  router.post('/create', protect, createQuiz);
+  router.get('/my-quizzes', protect, getTeacherQuizzes);
+  router.post('/toggle-public', protect, toggleQuizPublic);
+  router.get('/:quizId/analytics', protect, getQuizAnalytics);
+  router.post('/:quizId/duplicate', protect, duplicateQuiz);
+  router.get('/:quizId', protect, getQuiz);
+  router.put('/:quizId', protect, updateQuiz);
+  router.delete('/:quizId', protect, deleteQuiz);
+
+  return router;
+};

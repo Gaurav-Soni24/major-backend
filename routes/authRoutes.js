@@ -1,21 +1,18 @@
 const express = require('express');
-const router = express.Router();
 const { protect } = require('../middlewares/authMiddleware');
-const { 
-  registerUser, 
-  loginUser, 
-  googleAuth, 
-  updateProfile, 
-  getProfile 
-} = require('../controllers/authController');
+const { registerUser, loginUser, googleAuth, updateProfile, getProfile } = require('../controllers/authController');
 
-// Public Auth Routes
-router.post('/register', registerUser);
-router.post('/login', loginUser);
-router.post('/google', googleAuth);
+module.exports = (limiters) => {
+  const router = express.Router();
 
-// Protected Profile Routes (Require Teacher JWT)
-router.get('/profile', protect, getProfile);
-router.put('/profile', protect, updateProfile);
+  // Public
+  router.post('/register', limiters.auth, registerUser);
+  router.post('/login', limiters.auth, loginUser);
+  router.post('/google', limiters.google, googleAuth);
 
-module.exports = router;
+  // Teacher (Bearer JWT)
+  router.get('/profile', protect, getProfile);
+  router.put('/profile', protect, updateProfile);
+
+  return router;
+};

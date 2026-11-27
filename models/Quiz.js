@@ -13,12 +13,12 @@ const questionSchema = new mongoose.Schema({
   },
   text: { type: String, required: true },
   marks: { type: Number, required: true, default: 1 },
-  options: [optionSchema], 
-  correctAnswer: { type: mongoose.Schema.Types.Mixed }, 
-  codeLanguage: { type: String, default: 'javascript' }, 
-  starterCode: { type: String, default: '' },            
-  aiGradingRubric: { type: String, default: '' },        
-  originalIndex: { type: Number } 
+  options: [optionSchema],
+  correctAnswer: { type: mongoose.Schema.Types.Mixed },
+  codeLanguage: { type: String, default: 'javascript' },
+  starterCode: { type: String, default: '' },
+  aiGradingRubric: { type: String, default: '' },
+  originalIndex: { type: Number },
 });
 
 const quizSchema = new mongoose.Schema(
@@ -30,35 +30,45 @@ const quizSchema = new mongoose.Schema(
     },
     title: { type: String, required: true, trim: true },
     description: { type: String, trim: true },
-    
+
     // Custom Fields & Security
-    customFields: [{
-      name: { type: String, required: true },
-      type: { type: String, enum: ['text', 'number'], required: true }
-    }],
+    customFields: [
+      {
+        name: { type: String, required: true },
+        type: { type: String, enum: ['text', 'number'], required: true },
+      },
+    ],
+    // bcrypt hash. Legacy documents may still hold plaintext: it is accepted once and re-hashed.
     password: { type: String, default: '' },
-    
+
     instructions: [{ type: String, trim: true }],
     isPublic: { type: Boolean, default: false },
     timeLimit: { type: Number, default: null },
     passingScore: { type: Number, default: 60, min: 1, max: 100 },
-    
+
     settings: {
       shuffleQuestions: { type: Boolean, default: true },
       shuffleOptions: { type: Boolean, default: true },
       showAnswers: { type: Boolean, default: false },
     },
-    
+
     antiCheatSettings: {
       aiCamera: { type: Boolean, default: true },
       tabSwitch: { type: Boolean, default: true },
       copyPaste: { type: Boolean, default: true },
-      toleranceStrikes: { type: Number, default: 3 } 
+      toleranceStrikes: { type: Number, default: 3 },
     },
-    
+
     questions: [questionSchema],
   },
   { timestamps: true }
 );
+
+quizSchema.index({ userId: 1, createdAt: -1 });
+
+// Derived, never stored: draft = not public.
+quizSchema.virtual('status').get(function status() {
+  return this.isPublic ? 'published' : 'draft';
+});
 
 module.exports = mongoose.model('Quiz', quizSchema);

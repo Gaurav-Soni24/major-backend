@@ -1,67 +1,46 @@
 require('dotenv').config();
-const express = require('express');
-const cors = require('cors');
-const helmet = require('helmet');
-const morgan = require('morgan');
 const connectDB = require('./config/db');
+const { assertConfig } = require('./config/env');
+const app = require('./app');
+const { finalizeExpired } = require('./services/attemptService');
 
-// Connect to MongoDB
-connectDB();
+const SWEEP_MS = 60 * 1000;
 
-const app = express();
+const start = async () => {
+  // Fail closed with a readable message if required configuration is missing.
+  assertConfig();
+  await connectDB();
 
-// ==========================================
-// MIDDLEWARE
-// ==========================================
-// Helmet helps secure Express apps by setting various HTTP headers
-app.use(helmet());
+  const PORT = process.env.PORT || 5000;
+  const server = app.listen(PORT, () => {
+    console.log(`Server running in ${process.env.NODE_ENV || 'development'} mode on port ${PORT}`);
+  });
 
-// Enable Cross-Origin Resource Sharing
-app.use(cors());
+  // Every minute: grade attempts whose deadline (+ grace) has passed from their saved answers.
+  let running = false;
+  const timer = setInterval(async () => {
+    if (running) return;
+    running = true;
+    try {
+      const n = await finalizeExpired({ limit: 50 });
+      if (n > 0) console.log(`[attempts] finalized ${n} expired attempt(s)`);
+    } catch (err) {
+      console.error('[attempts] sweep failed:', String(err && err.message).slice(0, 200));
+    } finally {
+      running = false;
+    }
+  }, SWEEP_MS);
+  timer.unref();
 
-// INCREASED LIMIT: 50mb is required to safely handle multiple base64 webcam captures 
-// and large subjective text/code submissions from the frontend.
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+  const shutdown = () => {
+    clearInterval(timer);
+    server.close(() => process.exit(0));
+  };
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
+};
 
-// HTTP request logger middleware
-if (process.env.NODE_ENV === 'development') {
-    app.use(morgan('dev'));
-}
-
-const authRoutes = require('./routes/authRoutes');
-const quizRoutes = require('./routes/quizRoutes');
-const submitRoutes = require('./routes/submitRoutes');
-const aiRoutes = require('./routes/aiRoutes');
-
-app.use('/api/auth', authRoutes);
-app.use('/api/quizzes', quizRoutes);
-app.use('/api/submissions', submitRoutes);
-app.use('/api/ai', aiRoutes);
-
-// Base test route
-app.get('/', (req, res) => {
-    res.send('Quizify API Server is running...');
-});
-
-// ==========================================
-// GLOBAL ERROR HANDLER
-// ==========================================
-app.use((err, req, res, next) => {
-    console.error(err.stack);
-    const statusCode = res.statusCode === 200 ? 500 : res.statusCode;
-    res.status(statusCode).json({
-        success: false,
-        message: err.message || 'Server Error',
-        stack: process.env.NODE_ENV === 'production' ? null : err.stack,
-    });
-});
-
-// ==========================================
-// START SERVER
-// ==========================================
-const PORT = process.env.PORT || 5000;
-
-app.listen(PORT, () => {
-    console.log(`Server running in ${process.env.NODE_ENV} mode on port ${PORT}`);
+start().catch((err) => {
+  console.error(`Failed to start: ${err.message}`);
+  process.exit(1);
 });

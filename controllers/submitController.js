@@ -1,264 +1,380 @@
-const mongoose = require('mongoose'); 
-const { OAuth2Client } = require('google-auth-library');
 const Quiz = require('../models/Quiz');
 const Submission = require('../models/Submission');
-const { gradeAnswersWithAI } = require('./aiController');
+const { AppError } = require('../utils/AppError');
+const { escapeRegex, round2 } = require('../utils/text');
+const { signStudentToken } = require('../services/tokenService');
+const { verifyGoogleCredential } = require('../services/googleVerifier');
+const attempts = require('../services/attemptService');
+const { computeTotals } = require('../services/gradingService');
+const { validateCredential } = require('../validators/auth');
+const { Issues, isString, isPlainObject, queryString, parsePagination, paginationMeta, assertObjectId } = require('../validators/common');
 
-const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
+const NO_IMAGES = '-antiCheat.flaggedImages';
+const MAX_IMAGES = 20;
+const MAX_IMAGE_BYTES = 400 * 1024;
 
+// ------------------------------------------------------------------ student flow
+
+// @route POST /api/submissions/verify-google  { quizId | "portal-auth", credential }
 const verifyGoogleAttempt = async (req, res, next) => {
   try {
-    const { quizId, credential } = req.body;
-    if (!quizId || !credential) return res.status(400).json({ success: false, message: 'Missing parameters' });
+    const credential = validateCredential(req.body);
+    const quizId = req.body.quizId;
+    if (!isString(quizId) || !quizId) throw new AppError(400, 'VALIDATION_ERROR', 'Missing parameters', [{ field: 'quizId', message: 'quizId is required' }]);
+    if (quizId !== 'portal-auth') assertObjectId(quizId, 'quizId');
 
-    const ticket = await googleClient.verifyIdToken({
-      idToken: credential, audience: process.env.GOOGLE_CLIENT_ID,
-    });
-    const payload = ticket.getPayload();
-    const email = payload.email;
-
-    if (quizId === 'portal-auth') {
-       return res.status(200).json({ success: true, email, name: payload.name });
+    let payload;
+    try {
+      payload = await verifyGoogleCredential(credential);
+    } catch (err) {
+      throw new AppError(401, 'UNAUTHENTICATED', 'Invalid Google authentication.');
     }
-
-    if (!mongoose.isValidObjectId(quizId)) return res.status(400).json({ success: false, message: 'Invalid Assessment ID.' });
-
-    // CRITICAL: Checks if the user already has a submission record (even if 'in-progress' / abandoned)
-    const existingSubmission = await Submission.findOne({ quizId, 'userDetails.email': email });
-    if (existingSubmission) {
-      return res.status(403).json({ 
-        success: false, 
-        message: 'Security Alert: You have already started this assessment. Reloading or leaving the page is not permitted. You cannot attempt it again.' 
-      });
+    if (!payload || !payload.email || payload.email_verified !== true) {
+      throw new AppError(401, 'UNAUTHENTICATED', 'Your Google email is not verified.');
     }
+    const email = String(payload.email).toLowerCase();
+    const name = (payload.name || email.split('@')[0]).slice(0, 80);
+    const studentToken = signStudentToken({ email, name, googleId: payload.sub });
+    const identity = { success: true, email, name, googleId: payload.sub, studentToken };
 
-    res.status(200).json({ success: true, email, name: payload.name, googleId: payload.sub, status: 'new' });
+    if (quizId === 'portal-auth') return res.status(200).json({ ...identity, status: 'new' });
+
+    const quiz = await Quiz.findById(quizId).select('timeLimit isPublic');
+    if (!quiz) throw new AppError(404, 'NOT_FOUND', 'Assessment not found');
+
+    const existing = await Submission.findOne({ quizId, 'userDetails.email': email }).select('status startedAt deadlineAt');
+    if (existing) {
+      if (existing.status === 'in-progress' && !attempts.isPastGrace(existing, quiz)) {
+        return res.status(200).json({ ...identity, status: 'in-progress', submissionId: existing._id });
+      }
+      if (existing.status === 'in-progress') await attempts.submitAttempt(existing._id, { auto: true });
+      throw new AppError(403, 'ALREADY_SUBMITTED', 'You have already submitted this assessment.');
+    }
+    res.status(200).json({ ...identity, status: 'new' });
   } catch (error) {
-    res.status(401).json({ success: false, message: 'Invalid Google authentication.' });
+    next(error);
   }
 };
 
+// @route POST /api/submissions/start-attempt  (Authorization: Student <token>)
 const startAttempt = async (req, res, next) => {
   try {
-    const { quizId, userDetails, password } = req.body;
-
-    if (!quizId || !mongoose.isValidObjectId(quizId) || !userDetails || !userDetails.email) {
-      return res.status(400).json({ success: false, message: 'Missing or invalid parameters' });
+    const body = isPlainObject(req.body) ? req.body : {};
+    assertObjectId(body.quizId, 'quizId');
+    if (body.password !== undefined && body.password !== null && !isString(body.password)) {
+      throw new AppError(400, 'VALIDATION_ERROR', 'Invalid password', [{ field: 'password', message: 'password must be a string' }]);
     }
+    const quiz = await Quiz.findById(body.quizId);
+    if (!quiz) throw new AppError(404, 'NOT_FOUND', 'Quiz not found');
 
-    const quiz = await Quiz.findById(quizId);
-    if (!quiz) return res.status(404).json({ success: false, message: 'Quiz not found' });
+    // Legacy clients sent userDetails.customData; email and name always come from the verified token.
+    const customData = body.customData !== undefined ? body.customData : isPlainObject(body.userDetails) ? body.userDetails.customData : undefined;
+    const { submission, token, resumed } = await attempts.startAttempt({
+      quiz,
+      student: req.student,
+      customData,
+      password: body.password,
+    });
 
-    if (quiz.password && quiz.password !== password) {
-       return res.status(401).json({ success: false, message: 'Incorrect quiz password.' });
-    }
-
-    let submission = await Submission.findOne({ quizId, 'userDetails.email': userDetails.email });
-
-    // CRITICAL: Create the record instantly in the DB so they are tracked the second they start the timer
-    if (!submission) {
-      submission = await Submission.create({
-        quizId,
-        quizDescription: quiz.title,
-        userDetails, 
-        status: 'in-progress',
-        startedAt: new Date()
-      });
-    }
-
-    res.status(200).json({ success: true, submissionId: submission._id });
+    const now = new Date();
+    res.status(200).json({
+      success: true,
+      submissionId: submission._id,
+      attemptToken: token,
+      startedAt: submission.startedAt,
+      deadlineAt: attempts.deadlineOf(submission, quiz),
+      serverTime: now,
+      resumed,
+      answers: attempts.savedAnswersOf(submission),
+      antiCheat: {
+        tabSwitches: submission.antiCheat.tabSwitches,
+        webcamStrikes: submission.antiCheat.webcamStrikes,
+        copyPasteAttempts: submission.antiCheat.copyPasteAttempts,
+      },
+    });
   } catch (error) {
     next(error);
   }
 };
 
+// @route PUT /api/submissions/:submissionId/answers  (X-Attempt-Token)
+const saveAnswers = async (req, res, next) => {
+  try {
+    const quiz = await Quiz.findById(req.submission.quizId);
+    if (!quiz) throw new AppError(404, 'NOT_FOUND', 'Quiz not found');
+    const out = await attempts.saveAnswers({ submission: req.submission, quiz, answers: req.body.answers, antiCheat: req.body.antiCheat });
+    res.status(200).json({ success: true, ...out });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// Returns the decoded byte size of a base64 payload after validating its shape.
+const checkImage = (value) => {
+  if (!isString(value)) throw new AppError(400, 'VALIDATION_ERROR', 'Invalid image', [{ field: 'imageBase64', message: 'imageBase64 must be a string' }]);
+  const raw = value.replace(/^data:image\/(png|jpe?g|webp);base64,/i, '');
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(raw)) {
+    throw new AppError(400, 'VALIDATION_ERROR', 'Invalid image', [{ field: 'imageBase64', message: 'imageBase64 is not valid base64' }]);
+  }
+  const bytes = Math.floor((raw.length * 3) / 4) - (raw.endsWith('==') ? 2 : raw.endsWith('=') ? 1 : 0);
+  if (bytes > MAX_IMAGE_BYTES) throw new AppError(413, 'PAYLOAD_TOO_LARGE', 'Image is larger than 400 KB.');
+};
+
+// @route POST /api/submissions/flag  { submissionId, imageBase64?, reason }  (X-Attempt-Token)
 const flagActivity = async (req, res, next) => {
   try {
-    const { submissionId, imageBase64, reason } = req.body;
-    if (!submissionId || !mongoose.isValidObjectId(submissionId)) return res.status(400).json({ success: false, message: 'Invalid data' });
+    const { imageBase64, reason } = req.body;
+    const issues = new Issues();
+    if (reason !== undefined && reason !== null && (!isString(reason) || reason.length > 120)) issues.add('reason', 'reason must be a string of at most 120 characters');
+    issues.throwIfAny('Invalid data');
+    if (imageBase64 !== undefined && imageBase64 !== null && imageBase64 !== '') checkImage(imageBase64);
 
-    await Submission.findByIdAndUpdate(submissionId, {
-      $push: {
-        'antiCheat.flaggedImages': {
-          imageBase64: imageBase64 || 'NO_IMAGE', reason: reason || 'Suspicious Activity', timestamp: new Date()
-        }
-      },
-      $set: { 'antiCheat.isFlagged': true }
-    });
+    const sub = req.submission;
+    if (sub.status !== 'in-progress') throw new AppError(409, 'ALREADY_SUBMITTED', 'This attempt is already submitted.');
 
-    res.status(200).json({ success: true, message: 'Activity flagged securely.' });
-  } catch (error) {
-    res.status(500).json({ success: false, message: 'Failed to flag activity.' });
-  }
-};
-
-const processSubmission = async (req, res, next) => {
-  try {
-    const { submissionId, answers, antiCheat } = req.body;
-
-    if (!submissionId || !mongoose.isValidObjectId(submissionId) || !answers) {
-      return res.status(400).json({ success: false, message: 'Invalid required submission data.' });
-    }
-
-    const submission = await Submission.findById(submissionId);
-    if (!submission || submission.status === 'submitted') {
-      return res.status(400).json({ success: false, message: 'Invalid or already submitted session.' });
-    }
-
-    const quiz = await Quiz.findById(submission.quizId);
-    if (!quiz) return res.status(404).json({ success: false, message: 'Quiz not found.' });
-
-    let totalMaxMarks = 0;
-    let autoObtainedMarks = 0;
-    const processedQuestions = [];
-    const manualGradeQuestions = [];
-
-    quiz.questions.forEach((q, index) => {
-      totalMaxMarks += q.marks;
-      
-      // FIX: Match by questionId first (safest), fallback to DB's originalIndex, or array index if DB is missing it
-      const actualOriginalIndex = q.originalIndex !== undefined ? q.originalIndex : index;
-      const studentAnsObj = answers.find(a => 
-        (a.questionId && q._id && String(a.questionId) === String(q._id)) || 
-        (a.originalIndex === actualOriginalIndex)
-      );
-
-      // Safely extract the answer, ensuring we handle empty strings correctly vs completely missing
-      const studentAns = (studentAnsObj && studentAnsObj.userAnswer !== undefined) 
-                          ? studentAnsObj.userAnswer 
-                          : null;
-
-      let isCorrect = false;
-      let marksObtained = 0;
-      let correctAnswer;
-
-      if (q.type === 'single') {
-        const correctOpt = q.options.find(o => o.isCorrect);
-        correctAnswer = correctOpt ? correctOpt.text : null;
-        if (studentAns !== null && studentAns !== "" && studentAns === correctAnswer) { 
-          isCorrect = true; 
-          marksObtained = q.marks; 
-        }
-      } else if (q.type === 'multiple') {
-        const correctOpts = q.options.filter(o => o.isCorrect).map(o => o.text);
-        correctAnswer = correctOpts;
-        if (Array.isArray(studentAns) && studentAns.length > 0 && studentAns.length === correctOpts.length && studentAns.every(val => correctOpts.includes(val))) {
-          isCorrect = true; marksObtained = q.marks;
-        }
-      } else if (q.type === 'integer') {
-        correctAnswer = q.correctAnswer;
-        if (studentAns !== null && studentAns !== "" && String(studentAns).trim() === String(correctAnswer).trim()) {
-          isCorrect = true; marksObtained = q.marks;
-        }
-      } else {
-        correctAnswer = q.correctAnswer || q.aiGradingRubric;
-        manualGradeQuestions.push({
-          questionId: actualOriginalIndex, 
-          questionType: q.type, questionText: q.text,
-          studentAnswer: studentAns, correctAnswerRubric: correctAnswer, maxMarks: q.marks
-        });
-      }
-
-      autoObtainedMarks += marksObtained;
-      processedQuestions.push({
-        questionId: actualOriginalIndex, questionText: q.text, questionType: q.type,
-        userAnswer: studentAns, correctAnswer: correctAnswer, marks: q.marks,
-        isCorrect: isCorrect, marksObtained: marksObtained, aiFeedback: ''
-      });
-    });
-
-    let aiObtainedMarks = 0;
-    if (manualGradeQuestions.length > 0) {
-      const aiResults = await gradeAnswersWithAI(manualGradeQuestions);
-      if (Array.isArray(aiResults)) {
-        aiResults.forEach(aiGrade => {
-          const pqIndex = processedQuestions.findIndex(pq => pq.questionId === aiGrade.questionId);
-          if (pqIndex !== -1) {
-            processedQuestions[pqIndex].marksObtained = aiGrade.awardedMarks || 0;
-            processedQuestions[pqIndex].isCorrect = aiGrade.awardedMarks > 0;
-            processedQuestions[pqIndex].aiFeedback = aiGrade.feedback || '';
-            aiObtainedMarks += (aiGrade.awardedMarks || 0);
-          }
-        });
-      }
-    }
-
-    const totalObtainedMarks = autoObtainedMarks + aiObtainedMarks;
-    const percentage = totalMaxMarks > 0 ? parseFloat(((totalObtainedMarks / totalMaxMarks) * 100).toFixed(2)) : 0;
-
-    submission.status = 'submitted';
-    submission.submittedAt = new Date();
-    submission.score = { totalMarks: totalMaxMarks, obtainedMarks: totalObtainedMarks, percentage: percentage };
-    
-    const safeAC = antiCheat || {};
-    const updateData = {
-      status: submission.status,
-      submittedAt: submission.submittedAt,
-      score: submission.score,
-      questions: processedQuestions,
-      'antiCheat.tabSwitches': Math.max(submission.antiCheat?.tabSwitches || 0, safeAC.tabSwitches || 0),
-      'antiCheat.webcamStrikes': Math.max(submission.antiCheat?.webcamStrikes || 0, safeAC.webcamStrikes || 0),
-      'antiCheat.copyPasteAttempts': Math.max(submission.antiCheat?.copyPasteAttempts || 0, safeAC.copyPasteAttempts || 0),
-      'antiCheat.wasAutoSubmitted': safeAC.wasAutoSubmitted || false,
-      'antiCheat.identitySwapDetected': safeAC.identitySwapDetected || false,
-    };
-
-    if (safeAC.isFlagged || submission.antiCheat?.flaggedImages?.length > 0) {
-       updateData['antiCheat.isFlagged'] = true;
-    }
-
-    await Submission.findByIdAndUpdate(submissionId, { $set: updateData });
-
-    res.status(200).json({ success: true, message: 'Submission recorded securely.', score: submission.score });
+    // Count every flag; store at most MAX_IMAGES entries (atomic: the push only applies while there is room).
+    const counted = await Submission.updateOne(
+      { _id: sub._id, status: 'in-progress' },
+      { $inc: { 'antiCheat.flagCount': 1 }, $set: { 'antiCheat.isFlagged': true } }
+    );
+    if (counted.matchedCount === 0) throw new AppError(409, 'ALREADY_SUBMITTED', 'This attempt is already submitted.');
+    const pushed = await Submission.updateOne(
+      { _id: sub._id, [`antiCheat.flaggedImages.${MAX_IMAGES - 1}`]: { $exists: false } },
+      { $push: { 'antiCheat.flaggedImages': { imageBase64: imageBase64 || 'NO_IMAGE', reason: (reason || 'Suspicious Activity').trim() || 'Suspicious Activity', timestamp: new Date() } } }
+    );
+    res.status(200).json({ success: true, message: 'Activity flagged securely.', stored: pushed.modifiedCount > 0 });
   } catch (error) {
     next(error);
   }
 };
 
+// @route POST /api/submissions  { submissionId, answers?, antiCheat? }  (X-Attempt-Token)
+const processSubmission = async (req, res, next) => {
+  try {
+    const { submission, quiz } = await attempts.submitAttempt(req.submission._id, {
+      answers: req.body.answers,
+      antiCheat: req.body.antiCheat,
+    });
+    res.status(200).json(attempts.buildResultPayload(submission, quiz));
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @route GET /api/submissions/:submissionId/result  (X-Attempt-Token or Student token of the owner)
+const getResult = async (req, res, next) => {
+  try {
+    let sub = req.submission;
+    let quiz = await Quiz.findById(sub.quizId);
+    if (!quiz) throw new AppError(404, 'NOT_FOUND', 'Quiz not found');
+    if (sub.status === 'in-progress') {
+      if (!attempts.isPastGrace(sub, quiz)) throw new AppError(409, 'CONFLICT', 'This attempt is still in progress.');
+      ({ submission: sub, quiz } = await attempts.submitAttempt(sub._id, { auto: true }));
+    }
+    res.status(200).json(attempts.buildResultPayload(sub, quiz));
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @route GET /api/submissions/student/:email  (Student token for the same email)
+const getStudentSubmissions = async (req, res, next) => {
+  try {
+    const email = String(req.params.email || '').toLowerCase();
+    if (email !== req.student.email) throw new AppError(403, 'FORBIDDEN', 'You can only view your own results.');
+    const subs = await Submission.find({ 'userDetails.email': email, status: { $in: attempts.DONE } })
+      .select('quizId quizDescription status score submittedAt')
+      .sort({ submittedAt: -1 })
+      .limit(200)
+      .lean();
+    const quizzes = await Quiz.find({ _id: { $in: subs.map((s) => s.quizId) } }).select('title passingScore').lean();
+    const byId = new Map(quizzes.map((q) => [String(q._id), q]));
+    res.status(200).json({
+      success: true,
+      submissions: subs.map((s) => {
+        const q = byId.get(String(s.quizId));
+        const pct = s.score ? s.score.percentage : 0;
+        return {
+          _id: s._id,
+          quizId: s.quizId,
+          quizTitle: (q && q.title) || s.quizDescription || 'Untitled quiz',
+          status: s.status,
+          score: s.score,
+          passed: q ? pct >= q.passingScore : null,
+          submittedAt: s.submittedAt,
+        };
+      }),
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// ------------------------------------------------------------------ teacher review
+
+const ownedQuizOrForbidden = async (quizId, userId, select) => {
+  const quiz = quizId ? await Quiz.findOne({ _id: quizId, userId }).select(select) : null;
+  if (!quiz) throw new AppError(403, 'FORBIDDEN', 'Unauthorized access.');
+  return quiz;
+};
+
+// @route GET /api/submissions/quiz/:quizId?page&limit&status&flagged&search&sort  (owner)
 const getQuizSubmissions = async (req, res, next) => {
   try {
     const { quizId } = req.params;
-    if (!quizId || !mongoose.isValidObjectId(quizId)) return res.status(400).json({ success: false, message: 'Invalid Assessment ID.' });
-    
-    const quiz = await Quiz.findOne({ _id: quizId, userId: req.user.userId });
-    if (!quiz) return res.status(403).json({ success: false, message: 'Unauthorized access.' });
+    assertObjectId(quizId, 'quizId');
+    const quiz = await ownedQuizOrForbidden(quizId, req.user.userId, 'passingScore');
+    await attempts.finalizeExpired({ quizId: quiz._id, limit: 25 });
 
-    // CRITICAL: Sorting by startedAt instead of submittedAt so "in-progress" / abandoned attempts show at the top 
-    const submissions = await Submission.find({ quizId }).select('-antiCheat.flaggedImages').sort({ startedAt: -1 });
-    res.status(200).json({ success: true, submissions });
+    const pg = parsePagination(req.query);
+    const status = queryString(req.query, 'status', { oneOf: ['all', 'submitted', 'in-progress', 'graded'] }) || 'all';
+    const flagged = queryString(req.query, 'flagged', { oneOf: ['true', 'false'] });
+    const search = queryString(req.query, 'search', { max: 60 });
+    const sortKey = queryString(req.query, 'sort', { oneOf: ['newest', 'score'] }) || 'newest';
+
+    const filter = { quizId: quiz._id };
+    if (status !== 'all') filter.status = status;
+    if (flagged === 'true') filter['antiCheat.isFlagged'] = true;
+    if (search) {
+      const rx = { $regex: escapeRegex(search), $options: 'i' };
+      filter.$or = [{ 'userDetails.name': rx }, { 'userDetails.email': rx }];
+    }
+    const sort = sortKey === 'score' ? { 'score.percentage': -1, startedAt: -1 } : { startedAt: -1 };
+
+    const [submissions, total, agg] = await Promise.all([
+      Submission.find(filter).select(NO_IMAGES).sort(sort).skip(pg.skip).limit(pg.limit).lean(),
+      Submission.countDocuments(filter),
+      Submission.aggregate([
+        { $match: { quizId: quiz._id } },
+        {
+          $group: {
+            _id: null,
+            count: { $sum: 1 },
+            submitted: { $sum: { $cond: [{ $in: ['$status', attempts.DONE] }, 1, 0] } },
+            inProgress: { $sum: { $cond: [{ $eq: ['$status', 'in-progress'] }, 1, 0] } },
+            flagged: { $sum: { $cond: [{ $eq: ['$antiCheat.isFlagged', true] }, 1, 0] } },
+            pctSum: { $sum: { $cond: [{ $in: ['$status', attempts.DONE] }, '$score.percentage', 0] } },
+            passed: { $sum: { $cond: [{ $and: [{ $in: ['$status', attempts.DONE] }, { $gte: ['$score.percentage', quiz.passingScore] }] }, 1, 0] } },
+          },
+        },
+      ]),
+    ]);
+    const s = agg[0] || {};
+    const done = s.submitted || 0;
+    res.status(200).json({
+      success: true,
+      submissions,
+      pagination: paginationMeta(pg, total),
+      summary: {
+        count: s.count || 0,
+        submitted: done,
+        inProgress: s.inProgress || 0,
+        flagged: s.flagged || 0,
+        avgPercentage: done ? round2(s.pctSum / done) : 0,
+        passRate: done ? round2((s.passed / done) * 100) : 0,
+      },
+    });
   } catch (error) {
     next(error);
   }
 };
 
+// Loads a submission and checks that the teacher owns its quiz (403 otherwise).
+const loadOwnedSubmission = async (submissionId, userId, { images = false } = {}) => {
+  assertObjectId(submissionId, 'submissionId');
+  const q = Submission.findById(submissionId);
+  if (!images) q.select(NO_IMAGES);
+  const submission = await q;
+  if (!submission) throw new AppError(404, 'NOT_FOUND', 'Submission not found');
+  const quiz = await Quiz.findOne({ _id: submission.quizId, userId });
+  if (!quiz) throw new AppError(403, 'FORBIDDEN', 'You do not have access to this submission.');
+  return { submission, quiz };
+};
+
+// @route GET /api/submissions/details/:submissionId  (owner)
 const getSubmissionDetails = async (req, res, next) => {
   try {
-    const { submissionId } = req.params;
-    if (!submissionId || !mongoose.isValidObjectId(submissionId)) return res.status(400).json({ success: false, message: 'Invalid ID.' });
-
-    const submission = await Submission.findById(submissionId).populate('quizId');
-    if (!submission) return res.status(404).json({ success: false, message: 'Submission not found' });
-    
-    res.status(200).json({ success: true, submission });
+    const { submission, quiz } = await loadOwnedSubmission(req.params.submissionId, req.user.userId, { images: true });
+    res.status(200).json({
+      success: true,
+      submission,
+      quiz: { _id: quiz._id, title: quiz.title, passingScore: quiz.passingScore, timeLimit: quiz.timeLimit, antiCheatSettings: quiz.antiCheatSettings },
+    });
   } catch (error) {
     next(error);
   }
 };
 
-const getStudentSubmissions = async (req, res, next) => {
+// @route PATCH /api/submissions/details/:submissionId/grade  { questionIndex, marksObtained, feedback? }  (owner)
+const gradeSubmission = async (req, res, next) => {
   try {
-    const { email } = req.params;
-    const submissions = await Submission.find({ 
-      'userDetails.email': email,
-      status: { $in: ['submitted', 'graded'] }
-    }).select('-antiCheat.flaggedImages').sort({ submittedAt: -1 });
-                                        
-    if (!submissions || submissions.length === 0) return res.status(404).json({ success: false, message: 'No submissions found.' });
+    const { submission, quiz } = await loadOwnedSubmission(req.params.submissionId, req.user.userId);
+    const { questionIndex, marksObtained, feedback } = isPlainObject(req.body) ? req.body : {};
+    const issues = new Issues();
+    const q = Number.isInteger(questionIndex) ? submission.questions[questionIndex] : undefined;
+    if (!q) issues.add('questionIndex', 'questionIndex must be the index of a question in this submission');
+    if (typeof marksObtained !== 'number' || !Number.isFinite(marksObtained) || marksObtained < 0) issues.add('marksObtained', 'marksObtained must be a number of 0 or more');
+    else if (q && marksObtained > q.marks) issues.add('marksObtained', `marksObtained cannot exceed the question's ${q.marks} marks`);
+    if (feedback !== undefined && feedback !== null && (!isString(feedback) || feedback.length > 1000)) issues.add('feedback', 'feedback must be a string of at most 1000 characters');
+    issues.throwIfAny('Invalid grade');
+    if (!attempts.DONE.includes(submission.status)) throw new AppError(409, 'CONFLICT', 'Only submitted attempts can be graded.');
 
-    res.status(200).json({ success: true, submissions });
+    const marks = round2(marksObtained);
+    const records = submission.questions.map((x, i) => ({
+      marks: x.marks,
+      marksObtained: i === questionIndex ? marks : x.marksObtained,
+      needsReview: i === questionIndex ? false : !!x.needsReview,
+    }));
+    const totals = computeTotals(records, quiz.passingScore);
+    const needsReview = records.some((r) => r.needsReview);
+    const prefix = `questions.${questionIndex}`;
+    const set = {
+      [`${prefix}.marksObtained`]: marks,
+      [`${prefix}.isCorrect`]: marks > 0,
+      [`${prefix}.needsReview`]: false,
+      [`${prefix}.manuallyGraded`]: true,
+      score: { totalMarks: totals.totalMarks, obtainedMarks: totals.obtainedMarks, percentage: totals.percentage },
+      needsReview,
+      status: needsReview ? 'submitted' : 'graded',
+      gradedAt: needsReview ? submission.gradedAt || null : new Date(),
+    };
+    if (feedback !== undefined && feedback !== null) set[`${prefix}.teacherFeedback`] = feedback;
+    await Submission.updateOne({ _id: submission._id }, { $set: set });
+
+    res.status(200).json({
+      success: true,
+      message: 'Grade saved',
+      status: set.status,
+      needsReview,
+      score: set.score,
+      passed: totals.percentage >= quiz.passingScore,
+    });
   } catch (error) {
     next(error);
   }
 };
 
-module.exports = { verifyGoogleAttempt, startAttempt, flagActivity, processSubmission, getQuizSubmissions, getSubmissionDetails, getStudentSubmissions };
+// @route DELETE /api/submissions/details/:submissionId  (owner)
+const deleteSubmission = async (req, res, next) => {
+  try {
+    const { submission } = await loadOwnedSubmission(req.params.submissionId, req.user.userId);
+    await Submission.deleteOne({ _id: submission._id });
+    res.status(200).json({ success: true, message: 'Submission deleted' });
+  } catch (error) {
+    next(error);
+  }
+};
+
+module.exports = {
+  verifyGoogleAttempt,
+  startAttempt,
+  saveAnswers,
+  flagActivity,
+  processSubmission,
+  getResult,
+  getStudentSubmissions,
+  getQuizSubmissions,
+  getSubmissionDetails,
+  gradeSubmission,
+  deleteSubmission,
+};

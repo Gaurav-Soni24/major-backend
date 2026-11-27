@@ -1,10 +1,13 @@
 const express = require('express');
-const router = express.Router();
 const { protect } = require('../middlewares/authMiddleware');
 const { generateQuiz, regenerateQuestion } = require('../controllers/aiController');
 
-// All AI routes are protected (Teacher only)
-router.post('/generate-quiz', protect, generateQuiz);
-router.post('/regenerate-question', protect, regenerateQuestion); // NEW: Single question regeneration
+module.exports = (limiters) => {
+  const router = express.Router();
 
-module.exports = router;
+  // Teacher only. The limiter runs after `protect` so it can key on the teacher.
+  router.post('/generate-quiz', protect, limiters.ai, generateQuiz);
+  router.post('/regenerate-question', protect, limiters.ai, regenerateQuestion);
+
+  return router;
+};
